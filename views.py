@@ -1,46 +1,133 @@
-from django.shortcuts import get_object_or_404, render
+from django.shortcuts import render, get_object_or_404, redirect
 from django.http import HttpResponseRedirect
+from .models import Course, Enrollment, Question, Choice, Submission
+from django.contrib.auth.models import User
 from django.urls import reverse
-from .models import Course, Enrollment, Choice, Submission
+from django.views import generic
+from django.contrib.auth import login, logout, authenticate
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def registration_request(request):
+    context = {}
+    if request.method == 'GET':
+        return render(request, 'djangoapp/user_registration_bootstrap.html', context)
+    elif request.method == 'POST':
+        username = request.POST['username']
+        password = request.POST['psw']
+        first_name = request.POST['firstname']
+        last_name = request.POST['lastname']
+        user_exist = False
+        try:
+            User.objects.get(username=username)
+            user_exist = True
+        except:
+            logger.error("New user")
+        if not user_exist:
+            user = User.objects.create_user(
+                username=username, first_name=first_name, last_name=last_name, password=password
+            )
+            login(request, user)
+            return redirect("djangoapp:index")
+        else:
+            context['message'] = "User already exists."
+            return render(request, 'djangoapp/user_registration_bootstrap.html', context)
+
+
+def login_request(request):
+    context = {}
+    if request.method == "POST":
+        username = request.POST['username']
+        password = request.POST['psw']
+        user = authenticate(username=username, password=password)
+        if user is not None:
+            login(request, user)
+            return redirect('djangoapp:index')
+        else:
+            context['message'] = "Invalid username or password."
+            return render(request, 'djangoapp/user_login_bootstrap.html', context)
+    else:
+        return render(request, 'djangoapp/user_login_bootstrap.html', context)
+
+
+def logout_request(request):
+    logout(request)
+    return redirect('djangoapp:index')
+
+
+def check_if_enrolled(user, course):
+    is_enrolled = False
+    if user.id is not None:
+        num_results = Enrollment.objects.filter(user=user, course=course).count()
+        if num_results > 0:
+            is_enrolled = True
+    return is_enrolled
+
+
+class CourseListView(generic.ListView):
+    template_name = 'djangoapp/course_list_bootstrap.html'
+    context_object_name = 'course_list'
+
+    def get_queryset(self):
+        user = self.request.user
+        courses = Course.objects.order_by('-total_enrollment')[:10]
+        for course in courses:
+            if user.is_authenticated:
+                course.is_enrolled = check_if_enrolled(user, course)
+        return courses
+
+
+class CourseDetailView(generic.DetailView):
+    model = Course
+    template_name = 'djangoapp/course_details_bootstrap.html'
+
+
+def enroll(request, course_id):
+    course = get_object_or_404(Course, pk=course_id)
+    user = request.user
+    is_enrolled = check_if_enrolled(user, course)
+    if not is_enrolled and user.is_authenticated:
+        Enrollment.objects.create(user=user, course=course, mode='honor')
+        course.total_enrollment += 1
+        course.save()
+    return HttpResponseRedirect(reverse(viewname='djangoapp:course_details', args=(course.id,)))
+
+
+def extract_answers(request):
+    submitted_anwsers = []
+    for key in request.POST:
+        if key.startswith('choice'):
+            value = request.POST[key]
+            choice_id = int(value)
+            submitted_anwsers.append(choice_id)
+    return submitted_anwsers
+
 
 def submit(request, course_id):
     course = get_object_or_404(Course, pk=course_id)
-    enrollment = Enrollment.objects.first()
+    user = request.user
+    enrollment = Enrollment.objects.get(user=user, course=course)
     submission = Submission.objects.create(enrollment=enrollment)
-    
-    question_ids = request.POST.getlist('question_ids')
-    for q_id in question_ids:
-        choice_ids = request.POST.getlist(f'choices_{q_id}')
-        for c_id in choice_ids:
-            choice = Choice.objects.get(pk=c_id)
-            submission.choices.add(choice)
-            
-    return HttpResponseRedirect(reverse('djangoapp:show_exam_result', args=[course.id, submission.id]))
+    choices = extract_answers(request)
+    submission.choices.set(choices)
+    submission_id = submission.id
+    return HttpResponseRedirect(
+        reverse(viewname='djangoapp:show_exam_result', args=(course_id, submission_id,))
+    )
+
 
 def show_exam_result(request, course_id, submission_id):
+    context = {}
     course = get_object_or_404(Course, pk=course_id)
-    submission = get_object_or_404(Submission, pk=submission_id)
+    submission = Submission.objects.get(id=submission_id)
     choices = submission.choices.all()
-    
     total_score = 0
-    questions = course.question_set.all()
-    max_score = sum(q.grade for q in questions)
-    
-    grade_results = {}
-    for q in questions:
-        q_choices = q.choice_set.all()
-        correct_choices = set(c.id for c in q_choices if c.is_correct)
-        user_choices = set(c.id for c in choices if c.question == q)
-        if correct_choices == user_choices:
-            total_score += q.grade
-            grade_results[q] = True
-        else:
-            grade_results[q] = False
-            
-    context = {
-        'course': course,
-        'grade_results': grade_results,
-        'score': total_score,
-        'max_score': max_score
-    }
+    for choice in choices:
+        if choice.is_correct:
+            total_score += choice.question.grade
+    context['course'] = course
+    context['grade'] = total_score
+    context['choices'] = choices
     return render(request, 'djangoapp/exam_result_bootstrap.html', context)
